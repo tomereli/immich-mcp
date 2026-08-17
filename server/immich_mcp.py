@@ -459,28 +459,31 @@ async def immich_get_asset_metadata(
 # --------------------------------------------------------------------------- writes
 # Registered only when MCP_MODE=full. In read mode these tools do not exist at all -
 # they are absent from tools/list, so there is nothing for a client to talk itself into.
-# Note there is no delete tool in either mode, by design.
+#
+# One rule holds across everything below: NOTHING HERE DESTROYS A PHOTOGRAPH.
+#
+#   immich_delete_album      removes the album, never its contents (Immich's own
+#                            behaviour - assets outlive the albums that held them)
+#   immich_remove_from_album takes assets out of an album, leaving them in the library
+#   immich_trash_assets      moves to Immich's trash, which keeps them for the retention
+#                            period configured on the server (30 days by default)
+#   immich_restore_assets    brings them back
+#
+# The Immich API takes a `force` flag on asset deletion that bypasses the trash and
+# erases immediately. It is never sent. Deliberately there is no tool, and no argument,
+# that can reach it: an agent acting on a misheard "clean that up" should cost a click
+# to undo, not a photograph. Emptying the trash is done in Immich's own UI, by a human.
 
 if MCP_MODE == "full":
 
-    class UploadInput(BaseModel):
-        model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-        image_base64: str = Field(..., description="Base64-encoded image bytes (JPEG or PNG).", min_length=16)
-        filename: str = Field(..., description="Filename to store, e.g. 'hoya-2026-08-17.jpg'.", min_length=1, max_length=255)
-        album_id: Optional[str] = Field(default=None, description="Optional album to add it to immediately.")
-
-    class CreateAlbumInput(BaseModel):
-        model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-        name: str = Field(..., description="Album name.", min_length=1, max_length=200)
-        description: Optional[str] = Field(default=None, description="Optional description.", max_length=1000)
-
-    class AddToAlbumInput(BaseModel):
-        model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-        album_id: str = Field(..., description="Target album id.", min_length=1)
-        asset_ids: List[str] = Field(..., description="Asset ids to add.", min_length=1, max_length=100)
+    async def _find_album_by_name(name: str) -> Optional[Dict[str, Any]]:
+        """Case-insensitive exact match, so 'hoya' finds the album called 'Hoya'."""
+        albums = await _get_json("/api/albums")
+        target = name.strip().casefold()
+        for a in albums:
+            if (a.get("albumName") or "").strip().casefold() == target:
+                return a
+        return None
 
     @mcp.tool(
         name="immich_upload_image",
@@ -490,38 +493,77 @@ if MCP_MODE == "full":
     async def immich_upload_image(
         image_base64: Annotated[str, Field(description="Base64-encoded image bytes (JPEG or PNG).")],
         filename: Annotated[str, Field(description="Filename to store, e.g. hoya-2026-08-17.jpg")],
-        album_id: Annotated[Optional[str], Field(description="Optional album to add it to.")] = None,
+        album_id: Annotated[Optional[str], Field(description="Album id to file it under.")] = None,
+        album_name: Annotated[Optional[str], Field(
+            description="Album name to file it under. Matched case-insensitively; created if absent. "
+                        "Use this instead of album_id when working from a name the user said out loud."
+        )] = None,
+        taken_at: Annotated[Optional[str], Field(
+            description="ISO 8601 capture time, e.g. 2026-08-17T09:30:00Z. Defaults to now. "
+                        "Set it when the photograph was taken earlier than the upload."
+        )] = None,
     ) -> str:
-        """Upload a new image into Immich, optionally straight into an album.
+        """Upload a new image into Immich and file it under an album in one step.
 
-        Additive only - this never replaces or removes an existing asset.
+        This is the tool that removes the manual round trip: photograph in, correct
+        album, done. Give it album_name and the album is found or created as needed -
+        no need to list albums first.
+
+        Additive only. It never replaces or removes an existing asset. If Immich
+        recognises the bytes as one it already holds it returns status "duplicate"
+        and files the existing asset instead of storing a second copy.
 
         Returns:
-            str: JSON {"asset_id": str, "status": str, "added_to_album": bool}
+            str: JSON {"asset_id": str, "status": "created"|"duplicate",
+                       "album_id": str|null, "album_name": str|null,
+                       "album_created": bool, "added_to_album": bool}
                  or a plain-language error string.
         """
         try:
             raw = base64.b64decode(image_base64, validate=False)
             now = datetime.now(timezone.utc).isoformat()
+            when = (taken_at or "").strip() or now
+
+            # Resolve the album before uploading, so a bad album name fails before
+            # anything is stored rather than leaving an orphaned asset behind.
+            album_created = False
+            resolved_name = None
+            if album_name and not album_id:
+                existing = await _find_album_by_name(album_name)
+                if existing:
+                    album_id = existing.get("id")
+                    resolved_name = existing.get("albumName")
+                else:
+                    made = (await _request("POST", "/api/albums",
+                                           json={"albumName": album_name.strip()})).json()
+                    album_id = made.get("id")
+                    resolved_name = made.get("albumName")
+                    album_created = True
+
             files = {"assetData": (filename, raw, "application/octet-stream")}
             data = {
                 "deviceAssetId": f"claude-mcp-{filename}-{now}",
                 "deviceId": "claude-mcp",
-                "fileCreatedAt": now,
-                "fileModifiedAt": now,
+                "fileCreatedAt": when,
+                "fileModifiedAt": when,
             }
-            resp = await _request("POST", "/api/assets", files=files, data=data)
-            created = resp.json()
+            created = (await _request("POST", "/api/assets", files=files, data=data)).json()
             asset_id = created.get("id")
 
             added = False
             if album_id and asset_id:
-                await _request("PUT", f"/api/albums/{album_id}/assets",
-                               json={"ids": [asset_id]})
+                await _request("PUT", f"/api/albums/{album_id}/assets", json={"ids": [asset_id]})
                 added = True
 
             return json.dumps(
-                {"asset_id": asset_id, "status": created.get("status"), "added_to_album": added},
+                {
+                    "asset_id": asset_id,
+                    "status": created.get("status"),
+                    "album_id": album_id,
+                    "album_name": resolved_name,
+                    "album_created": album_created,
+                    "added_to_album": added,
+                },
                 ensure_ascii=False, indent=1,
             )
         except Exception as exc:  # noqa: BLE001
@@ -570,6 +612,140 @@ if MCP_MODE == "full":
             r = (await _request("PUT", f"/api/albums/{album_id}/assets",
                                 json={"ids": asset_ids})).json()
             return json.dumps(r, ensure_ascii=False, indent=1)
+        except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
+    @mcp.tool(
+        name="immich_update_album",
+        annotations={"title": "Rename or describe an Immich album", "readOnlyHint": False,
+                     "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+    )
+    async def immich_update_album(
+        album_id: Annotated[str, Field(description="Album id from immich_list_albums.")],
+        name: Annotated[Optional[str], Field(description="New album name. Omit to leave unchanged.")] = None,
+        description: Annotated[Optional[str], Field(description="New description. Omit to leave unchanged.")] = None,
+    ) -> str:
+        """Rename an album or change its description. Contents are untouched.
+
+        Returns:
+            str: JSON {"album_id": str, "name": str, "description": str}
+                 or a plain-language error string.
+        """
+        try:
+            payload: Dict[str, Any] = {}
+            if name is not None:
+                payload["albumName"] = name
+            if description is not None:
+                payload["description"] = description
+            if not payload:
+                return "Nothing to change — pass name, description, or both."
+            a = (await _request("PATCH", f"/api/albums/{album_id}", json=payload)).json()
+            return json.dumps(
+                {"album_id": a.get("id"), "name": a.get("albumName"),
+                 "description": a.get("description")},
+                ensure_ascii=False, indent=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
+    @mcp.tool(
+        name="immich_remove_from_album",
+        annotations={"title": "Remove assets from an album", "readOnlyHint": False,
+                     "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+    )
+    async def immich_remove_from_album(
+        album_id: Annotated[str, Field(description="Album id to remove them from.")],
+        asset_ids: Annotated[List[str], Field(description="Asset ids to remove from this album.")],
+    ) -> str:
+        """Take assets out of an album. The photographs stay in the library.
+
+        This is filing, not deletion — use it to move a photo to the right plant.
+        To put a photo in the trash instead, use immich_trash_assets.
+
+        Returns:
+            str: JSON list of {"id": str, "success": bool, "error": str|null}
+                 or a plain-language error string.
+        """
+        try:
+            r = (await _request("DELETE", f"/api/albums/{album_id}/assets",
+                                json={"ids": asset_ids})).json()
+            return json.dumps(r, ensure_ascii=False, indent=1)
+        except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
+    @mcp.tool(
+        name="immich_delete_album",
+        annotations={"title": "Delete an Immich album", "readOnlyHint": False,
+                     "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+    )
+    async def immich_delete_album(
+        album_id: Annotated[str, Field(description="Album id from immich_list_albums.")],
+    ) -> str:
+        """Delete an album. The photographs it held stay in the library.
+
+        Immich albums are labels, not folders — removing one never removes its
+        contents. The assets remain and can be gathered into a new album.
+
+        Returns:
+            str: JSON {"deleted_album_id": str, "assets_kept": int} or an error string.
+        """
+        try:
+            # Report how many assets survive, so the caller can see nothing was lost.
+            kept = len(await _album_assets(album_id))
+            await _request("DELETE", f"/api/albums/{album_id}")
+            return json.dumps({"deleted_album_id": album_id, "assets_kept": kept},
+                              ensure_ascii=False, indent=1)
+        except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
+    @mcp.tool(
+        name="immich_trash_assets",
+        annotations={"title": "Move photos to the Immich trash", "readOnlyHint": False,
+                     "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+    )
+    async def immich_trash_assets(
+        asset_ids: Annotated[List[str], Field(description="Asset ids to move to the trash.")],
+    ) -> str:
+        """Move photographs to Immich's trash, where they are recoverable.
+
+        This is the strongest delete available here, and it is reversible:
+        immich_restore_assets brings them back, and Immich keeps trashed items for
+        the retention period set on the server (30 days by default). Permanently
+        erasing them is only possible from Immich's own interface.
+
+        Returns:
+            str: JSON {"trashed": int, "asset_ids": [str], "recoverable": true,
+                       "restore_with": "immich_restore_assets"}
+                 or a plain-language error string.
+        """
+        try:
+            # force is never sent. Immich defaults to the trash; that is the point.
+            await _request("DELETE", "/api/assets", json={"ids": asset_ids})
+            return json.dumps(
+                {"trashed": len(asset_ids), "asset_ids": asset_ids, "recoverable": True,
+                 "restore_with": "immich_restore_assets"},
+                ensure_ascii=False, indent=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _error(exc)
+
+    @mcp.tool(
+        name="immich_restore_assets",
+        annotations={"title": "Restore photos from the Immich trash", "readOnlyHint": False,
+                     "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+    )
+    async def immich_restore_assets(
+        asset_ids: Annotated[List[str], Field(description="Asset ids to bring back out of the trash.")],
+    ) -> str:
+        """Bring photographs back out of the trash.
+
+        Returns:
+            str: JSON {"restored": int, "asset_ids": [str]} or an error string.
+        """
+        try:
+            await _request("POST", "/api/trash/restore/assets", json={"ids": asset_ids})
+            return json.dumps({"restored": len(asset_ids), "asset_ids": asset_ids},
+                              ensure_ascii=False, indent=1)
         except Exception as exc:  # noqa: BLE001
             return _error(exc)
 

@@ -20,11 +20,24 @@ you: "has the hoya put out new growth since June?"
 | `immich_list_assets` | assets in an album, `newest`/`oldest`, paginated, each with `days_ago` | read |
 | `immich_get_image` | one photo as an MCP **image content block**, resized, JPEG | read |
 | `immich_get_asset_metadata` | date, dimensions, size, camera, album membership — no pixels | read |
-| `immich_upload_image` | add a new image, optionally straight into an album | full |
+| `immich_upload_image` | add an image and file it under an album **by name**, created if absent | full |
 | `immich_create_album` | create an empty album | full |
 | `immich_add_to_album` | add existing assets to an album | full |
+| `immich_update_album` | rename an album or change its description | full |
+| `immich_remove_from_album` | take assets out of an album; they stay in the library | full |
+| `immich_delete_album` | delete an album; its photographs stay in the library | full |
+| `immich_trash_assets` | move photos to Immich's trash — recoverable | full |
+| `immich_restore_assets` | bring them back out of the trash | full |
 
-`MCP_MODE=read` is the default and the write tools are **not registered** — they are absent from `tools/list`, so there is nothing for a client to talk itself into. `MCP_MODE=full` adds the bottom three. There is no delete tool in either mode and that is not configurable.
+`MCP_MODE=read` is the default and the write tools are **not registered** — they are absent from `tools/list`, so there is nothing for a client to talk itself into.
+
+### Nothing in `full` mode can destroy a photograph
+
+That is a property of the code, not a promise about prompting. Immich's asset-delete API takes a `force` flag that bypasses the trash and erases immediately; **this server never sends it**, and no tool exposes an argument that could reach it. The strongest available action is a move to the trash, which Immich retains for the period configured on the server — 30 days out of the box — and `immich_restore_assets` reverses.
+
+Deleting an album deletes the label, not the contents; Immich albums are tags rather than folders, so the assets outlive them. Emptying the trash for real is left to Immich's own interface, where a human does it deliberately.
+
+The reasoning: an agent can be talked into things, and "clean that up" is genuinely ambiguous. Making the worst case cost a click to undo is cheaper than making the tool descriptions eloquent.
 
 Every entry carries `days_ago` alongside the timestamp, so a model comparing dates never has to do arithmetic it might get wrong.
 
