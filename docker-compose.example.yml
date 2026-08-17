@@ -1,0 +1,45 @@
+# Append these services to the `services:` block of the docker-compose.yml that
+# already runs Immich. They join Immich's own compose network, so the server is
+# reached as http://immich-server:2283 without going out to the LAN and back.
+#
+# Clone this repo next to that compose file, so ./immich-mcp/server resolves.
+# To run it somewhere else entirely, drop `depends_on` and point IMMICH_URL at
+# a reachable address such as http://192.168.1.10:2283.
+
+  immich-mcp:
+    container_name: immich_mcp
+    build: ./immich-mcp/server
+    environment:
+      IMMICH_URL: http://immich-server:2283
+      IMMICH_API_KEY: ${IMMICH_API_KEY}
+      MCP_BEARER_TOKEN: ${MCP_BEARER_TOKEN}
+      # read | full — see .env.example. Neither mode can delete.
+      MCP_MODE: read
+      # Optional: named in the "Immich is unreachable" message.
+      IMMICH_HOST_HINT: ${IMMICH_HOST_HINT:-}
+      PORT: 3000
+    ports:
+      - '3000:3000'
+    depends_on:
+      - immich-server
+    restart: always
+
+  # Optional. Runs once per `docker compose up`, probes the server above against
+  # a real asset out of your library, and writes selftest-out/report.json plus
+  # the image it got back. Delete this block once you trust the thing.
+  immich-mcp-selftest:
+    container_name: immich_mcp_selftest
+    build: ./immich-mcp/selftest
+    environment:
+      MCP_URL: http://immich-mcp:3000/mcp
+      MCP_BEARER_TOKEN: ${MCP_BEARER_TOKEN}
+      IMMICH_URL: http://immich-server:2283
+      IMMICH_API_KEY: ${IMMICH_API_KEY}
+      OUT_PATH: /out/report.json
+      WAIT_SECONDS: 15
+      # PROBE_UPLOAD: 1   # only with MCP_MODE=full; writes a 1x1 JPEG to the library
+    volumes:
+      - ./selftest-out:/out
+    depends_on:
+      - immich-mcp
+    restart: "no"

@@ -1,0 +1,15 @@
+# Never commit real credentials
+.env
+
+# Self-test output: contains a photograph out of a real library
+selftest-out/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS junk
+.DS_Store
+Thumbs.db
