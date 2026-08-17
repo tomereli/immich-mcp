@@ -753,12 +753,34 @@ if MCP_MODE == "full":
 # --------------------------------------------------------------------------- transport
 
 
+# Paths a client probes to discover an OAuth authorization server. They must be
+# answered with a plain 404 and nothing else.
+#
+# This is subtle and it costs an evening if you get it wrong. Under the MCP auth
+# spec a 401 means "authenticate, here is where to start", so answering these
+# probes with 401 sends the client hunting for an authorization server that does
+# not exist — it then fails to register a client and reports that the *server's*
+# sign-in service is broken. A 404 says plainly: there is no OAuth here, use the
+# credential you were already given.
+#
+# The same trap exists outside this process. Immich's SPA returns its index page
+# with 200 for any unrecognised path, so if Immich is mounted at the root of the
+# same hostname it will answer these probes with HTML and the client will try to
+# parse it as OAuth metadata. Give this server its own origin — a dedicated port
+# or hostname — rather than a sub-path beside a web app, so that the probes land
+# here and get the 404.
+OAUTH_DISCOVERY_PREFIX = "/.well-known/"
+
+
 class BearerAuth(BaseHTTPMiddleware):
     """The tunnel URL is guessable in principle; this makes knowing it insufficient."""
 
     async def dispatch(self, request, call_next):
         if request.url.path == "/healthz":
             return await call_next(request)
+
+        if request.url.path.startswith(OAUTH_DISCOVERY_PREFIX):
+            return JSONResponse({"error": "not_found"}, status_code=404)
 
         header = request.headers.get("authorization", "")
         if header.startswith("Bearer ") and header[7:] == MCP_BEARER_TOKEN:
