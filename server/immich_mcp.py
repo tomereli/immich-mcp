@@ -77,11 +77,16 @@ if not MCP_BEARER_TOKEN:
 # token below is what actually gates access - and unlike a Host header, an attacker
 # cannot set it.
 _security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+# The one path that serves MCP. Everything else on this server is a 404 - see the
+# note above BearerAuth for why that is load-bearing and not merely tidy.
+MCP_PATH = "/mcp"
+
 mcp = FastMCP(
     "immich_mcp",
     stateless_http=True,
     json_response=True,
-    streamable_http_path="/mcp",
+    streamable_http_path=MCP_PATH,
     transport_security=_security,
 )
 
@@ -753,33 +758,41 @@ if MCP_MODE == "full":
 # --------------------------------------------------------------------------- transport
 
 
-# Paths a client probes to discover an OAuth authorization server. They must be
-# answered with a plain 404 and nothing else.
+# This server has exactly two routes. Everything else is answered 404, and that
+# matters more than it looks.
 #
-# This is subtle and it costs an evening if you get it wrong. Under the MCP auth
-# spec a 401 means "authenticate, here is where to start", so answering these
-# probes with 401 sends the client hunting for an authorization server that does
-# not exist — it then fails to register a client and reports that the *server's*
-# sign-in service is broken. A 404 says plainly: there is no OAuth here, use the
-# credential you were already given.
+# A client registering this server first probes for an OAuth authorization server
+# at /.well-known/oauth-protected-resource and friends. Under the MCP auth spec a
+# 401 means "authenticate, here is where to start" — so answering a discovery
+# probe with 401 sends the client hunting for an OAuth server that does not
+# exist. It then fails to register a client and reports that *this server's*
+# sign-in service is broken, which points the blame at the wrong component
+# entirely. A 404 says plainly: no OAuth here, use the credential you were given.
 #
-# The same trap exists outside this process. Immich's SPA returns its index page
-# with 200 for any unrecognised path, so if Immich is mounted at the root of the
-# same hostname it will answer these probes with HTML and the client will try to
-# parse it as OAuth metadata. Give this server its own origin — a dedicated port
-# or hostname — rather than a sub-path beside a web app, so that the probes land
-# here and get the 404.
-OAUTH_DISCOVERY_PREFIX = "/.well-known/"
+# Whitelisting the two real routes, rather than blacklisting /.well-known/,
+# survives a reverse proxy that strips a path prefix before forwarding — in which
+# case the probe arrives as /oauth-protected-resource with no /.well-known/ on it
+# and a prefix test would miss.
+#
+# The same trap exists outside this process and cannot be fixed from in here: a
+# SPA like Immich answers any unknown path with its index page and HTTP 200, so
+# if it holds the root of the hostname it will answer these probes with HTML that
+# the client tries to parse as OAuth metadata. Route the discovery paths to this
+# server, or give it its own hostname.
+OPEN_PATHS = frozenset({"/healthz"})
 
 
 class BearerAuth(BaseHTTPMiddleware):
     """The tunnel URL is guessable in principle; this makes knowing it insufficient."""
 
     async def dispatch(self, request, call_next):
-        if request.url.path == "/healthz":
+        path = request.url.path
+        if path in OPEN_PATHS:
             return await call_next(request)
 
-        if request.url.path.startswith(OAUTH_DISCOVERY_PREFIX):
+        # Not the MCP endpoint => nothing lives here. Say so, and say it before
+        # the auth check, so a discovery probe never sees a 401.
+        if path.rstrip("/") != MCP_PATH:
             return JSONResponse({"error": "not_found"}, status_code=404)
 
         header = request.headers.get("authorization", "")
