@@ -461,6 +461,72 @@ async def immich_get_asset_metadata(
         return _error(exc)
 
 
+@mcp.tool(
+    name="immich_list_unfiled_assets",
+    annotations={
+        "title": "List Immich photos not in any album",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def immich_list_unfiled_assets(
+    limit: Annotated[int, Field(description="Max assets to return (1-200).", ge=1, le=200)] = 20,
+    offset: Annotated[int, Field(description="Assets to skip, for pagination.", ge=0)] = 0,
+    order: Annotated[AssetOrder, Field(description="newest or oldest by capture date.")] = AssetOrder.NEWEST,
+) -> str:
+    """List photographs in the library that are not in any album yet - the inbox.
+
+    This is where a phone's automatic backup leaves things, so it answers "what is
+    new and unsorted?" - a question the album-based tools cannot ask.
+
+    The intended loop: read this list, call immich_get_image on each entry to see
+    what it actually is, then immich_add_to_album to file it. Pass a small
+    max_dimension to immich_get_image while sorting; recognising a subject needs a
+    fraction of the detail a full-size fetch returns.
+
+    Returns:
+        str: JSON with schema
+        {
+          "total": int, "count": int, "offset": int,
+          "has_more": bool, "next_offset": int|null,
+          "assets": [
+            {"asset_id": str, "filename": str, "taken_at": str,
+             "days_ago": int, "type": "image"|"video"}
+          ]
+        }
+        An empty list means everything in the library has been filed.
+    """
+    try:
+        # isNotInAlbum is Immich's own filter, so the "is it filed?" question is
+        # answered by the database rather than by listing every album and
+        # subtracting - which would be O(albums) requests and race with uploads.
+        data = await _post_json("/api/search/metadata", {"isNotInAlbum": True, "size": 1000})
+        items = (data.get("assets") or {}).get("items") or []
+        items.sort(
+            key=lambda a: _parse_ts(a.get("fileCreatedAt")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=(order == AssetOrder.NEWEST),
+        )
+        total = len(items)
+        page = items[offset : offset + limit]
+        consumed = offset + len(page)
+        return json.dumps(
+            {
+                "total": total,
+                "count": len(page),
+                "offset": offset,
+                "has_more": consumed < total,
+                "next_offset": consumed if consumed < total else None,
+                "assets": [_summarise(a) for a in page],
+            },
+            ensure_ascii=False,
+            indent=1,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
 # --------------------------------------------------------------------------- writes
 # Registered only when MCP_MODE=full. In read mode these tools do not exist at all -
 # they are absent from tools/list, so there is nothing for a client to talk itself into.
