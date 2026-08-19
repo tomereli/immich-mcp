@@ -19,7 +19,9 @@ you: "has the hoya put out new growth since June?"
 | `immich_list_albums` | album id, name, asset count, most recent asset + `days_ago` | read |
 | `immich_list_assets` | assets in an album, `newest`/`oldest`, paginated, each with `days_ago` | read |
 | `immich_get_image` | one photo as an MCP **image content block**, resized, JPEG | read |
-| `immich_get_asset_metadata` | date, dimensions, size, camera, album membership — no pixels | read |
+| `immich_get_asset_metadata` | date, dimensions, size, camera, album membership — plus duration/fps/rotation for video | read |
+| `immich_list_unfiled_assets` | photos in no album yet — the inbox a phone's auto-backup fills | read |
+| `immich_get_video_frames` | still frames from a video at chosen timestamps, as images | read |
 | `immich_upload_image` | add an image and file it under an album **by name**, created if absent | full |
 | `immich_create_album` | create an empty album | full |
 | `immich_add_to_album` | add existing assets to an album | full |
@@ -67,6 +69,30 @@ Roughly 13× smaller and universally decodable, with no image format work done a
 The visible consequence is that `max_dimension` is **capped at 1440**. That is not a limitation worth removing — going above it would mean decoding HEIC to gain detail nobody needs.
 
 One subtlety that is easy to get wrong: return the mimeType that matches the **bytes you actually send**, not the asset's original mimeType. A JPEG labelled `image/heic` fails to render and looks like a server bug.
+
+---
+
+## Seeing into a video
+
+`immich_get_video_frames` decodes stills out of a clip at moments you choose. Not playback — the events worth seeing in a short video are usually seconds apart, so a handful of frames carries nearly all of it at a fraction of the cost.
+
+```
+immich_get_asset_metadata(asset_id)          -> duration 21.6s, 24 fps, rotation -90
+immich_get_video_frames(asset_id, count=6)   -> an overview
+immich_get_video_frames(asset_id, timestamps=[9.5, 10, 10.5, 11])   -> narrow in
+```
+
+That second step is the point, and it only works if the timestamps are honest.
+
+**Seek accuracy is the whole feature.** A fast seek snaps to the nearest keyframe, which on phone video can be seconds away — so a frame labelled `t=8.0` that actually shows `t=5.2` is worse than no frame, because you will reason about timing from the label. This uses `-accurate_seek` with `-copyts` and reports the **decoded** PTS rather than the requested value; where they differ by more than 0.2 s the text block says so explicitly. Measured against a 4K iPhone clip: requested 9.5/10.0/10.5/11.0, delivered 9.50/10.00/10.50/11.00.
+
+**Frames come from the original, not a transcode**, because a re-encode smears exactly the fine texture that tends to be the reason for looking. ffmpeg range-seeks over HTTP rather than downloading — four frames out of a 99 MB 4K clip takes under three seconds.
+
+**Rotation is applied.** Phone video stores a rotation flag rather than rotated pixels; the returned dimensions are the proof (a 3840×2160 clip flagged −90 comes back portrait). Note `-autorotate` is a *boolean* flag — passing `-autorotate 1` makes ffmpeg read the `1` as an output filename and fail.
+
+Eight frames per call is a hard cap, deliberately. Eight at 768 px is already a large slice of a context window, and there is no "every frame" mode. Passing an image asset returns a message pointing at `immich_get_image` rather than a decode error.
+
+Requires `ffmpeg` in the image — the Dockerfile installs it. Immich reports only a duration for videos and leaves `exifInfo` empty, so fps, rotation and audio come from `ffprobe`.
 
 ---
 

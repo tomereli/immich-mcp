@@ -14,6 +14,7 @@ Transport is streamable HTTP with stateless JSON responses, because the intended
 client is a hosted assistant that only connects to remote URL-based MCP servers.
 """
 
+import asyncio
 import base64
 import io
 import json
@@ -183,6 +184,156 @@ def _summarise(asset: Dict[str, Any]) -> Dict[str, Any]:
         "days_ago": _days_ago(taken),
         "type": "video" if asset.get("type") == "VIDEO" else "image",
     }
+
+
+# ----------------------------------------------------------------------- video
+
+# Eight frames at 768px is already a substantial slice of a context window, so the
+# cap is deliberate and there is no "every frame" mode. The subjects this exists
+# for - an espresso extraction, a plant moving in wind - change over seconds, not
+# milliseconds, so a handful of chosen moments carries nearly all the information
+# in the clip.
+MAX_VIDEO_FRAMES = 8
+
+# Past this much drift between the requested and the delivered moment, the frame
+# is labelled rather than silently mislabelled. Reasoning about *when* something
+# happened from a frame stamped with a time it does not show is worse than having
+# no frame at all.
+SEEK_DRIFT_TOLERANCE = 0.2
+
+# showinfo prints one of these per decoded frame, on stderr.
+_PTS_RE = re.compile(r"pts_time:\s*([0-9]+\.?[0-9]*)")
+
+
+class FFmpegMissing(Exception):
+    """ffmpeg/ffprobe are absent - the image was built without them."""
+
+
+def _video_url(asset_id: str, source: str) -> str:
+    tail = "original" if source == "original" else "video/playback"
+    return f"{IMMICH_URL}/api/assets/{asset_id}/{tail}"
+
+
+def _ff_headers() -> str:
+    """ffmpeg wants CRLF-terminated header lines."""
+    return f"x-api-key: {IMMICH_API_KEY}\r\n"
+
+
+async def _run(cmd: List[str], timeout: float = 180.0):
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+    except FileNotFoundError as exc:
+        raise FFmpegMissing(str(exc)) from exc
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+    return proc.returncode, out, err
+
+
+def _fraction(value: Optional[str]) -> Optional[float]:
+    """ffprobe reports frame rates as '30000/1001'."""
+    try:
+        num, _, den = (value or "").partition("/")
+        d = float(den or 1)
+        return round(float(num) / d, 3) if d else None
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+async def _probe_video(asset_id: str) -> Dict[str, Any]:
+    """Read duration, fps, rotation and audio presence straight from the container.
+
+    Immich reports only a duration for videos and leaves exifInfo empty, so the
+    fields needed to choose sensible timestamps have to come from the file.
+    """
+    code, out, err = await _run(
+        [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams",
+            "-headers", _ff_headers(),
+            _video_url(asset_id, "original"),
+        ],
+        timeout=90.0,
+    )
+    if code != 0:
+        raise RuntimeError((err or b"").decode(errors="replace")[-300:] or "ffprobe failed")
+
+    data = json.loads(out or b"{}")
+    streams = data.get("streams") or []
+    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+
+    # Rotation lives in side data on modern files and in a tag on older ones.
+    rotation = None
+    for sd in video.get("side_data_list") or []:
+        if sd.get("rotation") is not None:
+            rotation = sd["rotation"]
+    if rotation is None:
+        try:
+            rotation = int((video.get("tags") or {}).get("rotate"))
+        except (TypeError, ValueError):
+            rotation = None
+
+    duration = (data.get("format") or {}).get("duration") or video.get("duration")
+    return {
+        "duration_seconds": round(float(duration), 3) if duration else None,
+        "fps": _fraction(video.get("avg_frame_rate")) or _fraction(video.get("r_frame_rate")),
+        "rotation": int(rotation) if rotation is not None else 0,
+        "has_audio": any(s.get("codec_type") == "audio" for s in streams),
+        "width": video.get("width"),
+        "height": video.get("height"),
+        "codec": video.get("codec_name"),
+    }
+
+
+async def _extract_frame(asset_id: str, at: float, max_dimension: int, source: str):
+    """Decode one frame and return (jpeg_bytes, actual_pts, width, height).
+
+    -ss before -i seeks by keyframe index, which is fast but can land seconds
+    early on phone video; -accurate_seek makes ffmpeg decode forward from that
+    keyframe to the requested moment, keeping the speed and losing the lie.
+    -copyts then leaves timestamps on the source timeline so showinfo reports
+    where the frame really came from, which is what gets reported back.
+    Rotation is left to ffmpeg's default autorotate, which is on: phone video
+    stores a rotation flag rather than rotated pixels, and an unrotated frame
+    wastes the budget on letterboxing. It is not passed explicitly because
+    -autorotate is a boolean flag, so "-autorotate 1" makes ffmpeg read the 1 as
+    an output filename. The returned width and height are the proof it applied.
+    """
+    scale = (
+        f"scale='min(iw,{max_dimension})':'min(ih,{max_dimension})'"
+        ":force_original_aspect_ratio=decrease"
+    )
+    code, out, err = await _run(
+        [
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info",
+            "-accurate_seek", "-ss", f"{at:.3f}", "-copyts",
+            "-headers", _ff_headers(),
+            "-i", _video_url(asset_id, source),
+            "-frames:v", "1",
+            "-vf", f"showinfo,{scale}",
+            "-f", "image2", "-c:v", "png", "pipe:1",
+        ]
+    )
+    if code != 0 or not out:
+        raise RuntimeError((err or b"").decode(errors="replace")[-300:] or "no frame decoded")
+
+    stderr = (err or b"").decode(errors="replace")
+    match = _PTS_RE.search(stderr)
+    actual = round(float(match.group(1)), 3) if match else None
+
+    # ffmpeg emits PNG so the single lossy encode happens here, at a known quality,
+    # rather than compounding with an intermediate JPEG.
+    img = PILImage.open(io.BytesIO(out))
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85, optimize=True)
+    return buf.getvalue(), actual, img.width, img.height
 
 
 # --------------------------------------------------------------------------- inputs
@@ -440,23 +591,45 @@ async def immich_get_asset_metadata(
         except Exception:  # noqa: BLE001 - album membership is a nicety, not the point
             albums = []
         taken = meta.get("fileCreatedAt")
-        return json.dumps(
-            {
-                "asset_id": meta.get("id"),
-                "filename": meta.get("originalFileName"),
-                "type": "video" if meta.get("type") == "VIDEO" else "image",
-                "taken_at": taken,
-                "days_ago": _days_ago(taken),
-                "mime_type": meta.get("originalMimeType"),
-                "width": exif.get("exifImageWidth"),
-                "height": exif.get("exifImageHeight"),
-                "file_size_bytes": exif.get("fileSizeInByte"),
-                "camera": exif.get("model"),
-                "albums": [{"album_id": a.get("id"), "name": a.get("albumName")} for a in albums],
-            },
-            ensure_ascii=False,
-            indent=1,
-        )
+        is_video = meta.get("type") == "VIDEO"
+        payload: Dict[str, Any] = {
+            "asset_id": meta.get("id"),
+            "filename": meta.get("originalFileName"),
+            "type": "video" if is_video else "image",
+            "taken_at": taken,
+            "days_ago": _days_ago(taken),
+            "mime_type": meta.get("originalMimeType"),
+            "width": exif.get("exifImageWidth"),
+            "height": exif.get("exifImageHeight"),
+            "file_size_bytes": exif.get("fileSizeInByte"),
+            "camera": exif.get("model"),
+            "albums": [{"album_id": a.get("id"), "name": a.get("albumName")} for a in albums],
+        }
+
+        # Immich reports a duration for videos and leaves exifInfo empty, so fps,
+        # rotation and audio have to be read out of the container itself. Without
+        # duration here, immich_get_video_frames would have to burn a call just to
+        # discover how long the clip is before it could choose timestamps.
+        if is_video:
+            try:
+                probe = await _probe_video(asset_id)
+                payload["video"] = probe
+                payload["width"] = payload["width"] or probe.get("width")
+                payload["height"] = payload["height"] or probe.get("height")
+                payload["next"] = (
+                    "Use immich_get_video_frames with count=6 for an overview, then explicit "
+                    "timestamps to narrow in on whatever changed."
+                )
+            except FFmpegMissing:
+                payload["video"] = {
+                    "error": "ffmpeg is not installed in this container; rebuild the image.",
+                    "duration_seconds": round(meta["duration"] / 1000, 3)
+                    if isinstance(meta.get("duration"), (int, float)) else None,
+                }
+            except Exception as exc:  # noqa: BLE001 - metadata is still worth returning
+                payload["video"] = {"error": f"could not probe the file: {exc}"}
+
+        return json.dumps(payload, ensure_ascii=False, indent=1)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
@@ -525,6 +698,148 @@ async def immich_list_unfiled_assets(
         )
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
+
+
+@mcp.tool(
+    name="immich_get_video_frames",
+    annotations={
+        "title": "Extract still frames from an Immich video",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def immich_get_video_frames(
+    asset_id: Annotated[str, Field(description="Video asset id from immich_list_assets.")],
+    timestamps: Annotated[Optional[List[float]], Field(
+        description="Seconds from the start of the clip. Up to 8. Mutually exclusive with count."
+    )] = None,
+    count: Annotated[Optional[int], Field(
+        description="Alternative to timestamps: N evenly spaced frames across the clip, 2-8. "
+                    "Use for a first pass when the timeline is unknown.", ge=2, le=MAX_VIDEO_FRAMES
+    )] = None,
+    max_dimension: Annotated[int, Field(
+        description="Longest edge in px (128-1440).", ge=128, le=PREVIEW_LONG_EDGE
+    )] = 768,
+) -> list:
+    """Pull still frames out of a video at chosen moments, as real images.
+
+    Video cannot be watched through this interface, but the events that matter in
+    a short clip are usually seconds apart, so a handful of stills at the right
+    moments carries nearly all of the diagnostic content.
+
+    The intended loop is iterative narrowing: start with count=6 for an overview,
+    read what changed and where, then come back with explicit timestamps to
+    bracket the moment - [9.5, 10, 10.5, 11]. That only works because the
+    timestamp reported for each frame is the one actually decoded, not the one
+    requested; where the two differ by more than 0.2s the text block says so.
+
+    For images use immich_get_image instead. Use immich_get_asset_metadata first
+    to learn the duration, otherwise choosing timestamps is guesswork.
+
+    Returns:
+        list: for each frame in ascending time order, a TextContent naming the
+        frame index and its true timestamp, followed by an ImageContent (JPEG);
+        then a final TextContent with the clip duration, capture date and which
+        rendition was decoded. On failure, a single TextContent explaining why.
+    """
+    try:
+        if (timestamps is None) == (count is None):
+            return [TextContent(type="text", text=(
+                "Pass exactly one of timestamps or count. Use count for a first look at a "
+                "clip whose timeline you do not know yet, then timestamps to narrow in."
+            ))]
+
+        meta = await _get_json(f"/api/assets/{asset_id}")
+        if meta.get("type") != "VIDEO":
+            return [TextContent(type="text", text=(
+                f"{meta.get('originalFileName')} is an image, not a video. "
+                "Use immich_get_image for still photographs; this tool decodes video only."
+            ))]
+
+        probe = await _probe_video(asset_id)
+        duration = probe.get("duration_seconds")
+
+        if timestamps is not None:
+            if not timestamps:
+                return [TextContent(type="text", text="timestamps was empty — pass at least one.")]
+            if len(timestamps) > MAX_VIDEO_FRAMES:
+                return [TextContent(type="text", text=(
+                    f"{len(timestamps)} frames requested; the limit is {MAX_VIDEO_FRAMES} per call. "
+                    "Eight frames is already a large amount of context — narrow the range and "
+                    "call again rather than widening this one."
+                ))]
+            wanted = sorted(float(t) for t in timestamps)
+            if wanted[0] < 0:
+                return [TextContent(type="text", text="Timestamps must be zero or greater.")]
+            if duration and wanted[-1] > duration:
+                return [TextContent(type="text", text=(
+                    f"Timestamp {wanted[-1]:.2f}s is past the end of this {duration:.2f}s clip."
+                ))]
+        else:
+            if not duration:
+                return [TextContent(type="text", text=(
+                    "Could not read this clip's duration, so evenly spaced frames cannot be "
+                    "placed. Pass explicit timestamps instead."
+                ))]
+            # Span the clip from its first moment to just short of the last, rather
+            # than the centres of equal segments: the opening instant is usually the
+            # baseline you compare everything else against, and the final frame is
+            # where a decode is most likely to fall off the end of the file.
+            span = duration * 0.98
+            wanted = [round(span * i / (count - 1), 3) for i in range(count)]
+
+        out: List[Any] = []
+        drifted = 0
+        for index, at in enumerate(wanted, start=1):
+            try:
+                jpeg, actual, width, height = await _extract_frame(
+                    asset_id, at, max_dimension, "original"
+                )
+            except FFmpegMissing:
+                return [TextContent(type="text", text=(
+                    "ffmpeg is not installed in this server's container, so video frames "
+                    "cannot be decoded. Rebuild the image — the Dockerfile installs it."
+                ))]
+            except Exception as exc:  # noqa: BLE001 - one bad frame must not lose the rest
+                out.append(TextContent(type="text", text=(
+                    f"Frame {index} of {len(wanted)} at {at:.2f}s could not be decoded: {exc}"
+                )))
+                continue
+
+            shown = actual if actual is not None else at
+            note = ""
+            if actual is not None and abs(actual - at) > SEEK_DRIFT_TOLERANCE:
+                drifted += 1
+                note = (f" — NOTE: asked for {at:.2f}s, this frame is {actual:.2f}s "
+                        f"({actual - at:+.2f}s); the nearest decodable frame was not where "
+                        f"it was requested, so read the time on the frame, not the request")
+            out.append(TextContent(type="text", text=(
+                f"Frame {index} of {len(wanted)} — t={shown:.2f}s, {width}x{height}{note}"
+            )))
+            out.append(ImageContent(
+                type="image", data=base64.b64encode(jpeg).decode("ascii"), mimeType="image/jpeg"
+            ))
+
+        taken = meta.get("fileCreatedAt")
+        ago = _days_ago(taken)
+        tail = (
+            f"{meta.get('originalFileName')} — {duration:.2f}s"
+            if duration else f"{meta.get('originalFileName')}"
+        )
+        tail += f", {probe.get('fps')} fps" if probe.get("fps") else ""
+        tail += f", filmed {taken}" + (f" ({ago} days ago)" if ago is not None else "")
+        tail += ". Decoded from the original file, not a transcode, so fine texture is intact."
+        if probe.get("rotation"):
+            tail += f" Rotation metadata of {probe['rotation']}° was applied."
+        if drifted:
+            tail += (f" {drifted} of {len(wanted)} frames landed more than "
+                     f"{SEEK_DRIFT_TOLERANCE}s from the requested moment — see the notes above.")
+        out.append(TextContent(type="text", text=tail))
+        return out
+    except Exception as exc:  # noqa: BLE001
+        return [TextContent(type="text", text=_error(exc))]
 
 
 # --------------------------------------------------------------------------- writes
