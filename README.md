@@ -78,8 +78,10 @@ One subtlety that is easy to get wrong: return the mimeType that matches the **b
 
 ```
 immich_get_asset_metadata(asset_id)          -> duration 21.6s, 24 fps, rotation -90
-immich_get_video_frames(asset_id, count=6)   -> an overview
+immich_get_video_frames(asset_id, count=8)   -> an overview
 immich_get_video_frames(asset_id, timestamps=[9.5, 10, 10.5, 11])   -> narrow in
+immich_get_video_frames(asset_id, count=20, start_seconds=120, end_seconds=150)
+                                             -> sample one window of a long clip densely
 ```
 
 That second step is the point, and it only works if the timestamps are honest.
@@ -90,7 +92,15 @@ That second step is the point, and it only works if the timestamps are honest.
 
 **Rotation is applied.** Phone video stores a rotation flag rather than rotated pixels; the returned dimensions are the proof (a 3840×2160 clip flagged −90 comes back portrait). Note `-autorotate` is a *boolean* flag — passing `-autorotate 1` makes ffmpeg read the `1` as an output filename and fail.
 
-Eight frames per call is a hard cap, deliberately. Eight at 768 px is already a large slice of a context window, and there is no "every frame" mode. Passing an image asset returns a message pointing at `immich_get_image` rather than a decode error.
+**The budget is pixels, not frames.** How many frames is right depends on the clip and the question, so the caller chooses. What is actually scarce is total area — 32 frames at 256 px cost a third of 4 frames at 1440 px — so the limit is a pixel budget (24 MP by default, `MCP_VIDEO_FRAME_BUDGET_MP`), and the 64-frame ceiling exists only to stop a runaway request.
+
+Exceeding the budget returns arithmetic rather than a refusal:
+
+> *64 frames at 1920px is about 132.7 megapixels (~177k vision tokens), over the 24 MP budget for one call. Either 11 frames at 1920px, or all 64 at max_dimension=816. Cost scales with area, so halving the dimension buys four times the frames.*
+
+That lets a caller trade resolution against frame count deliberately instead of guessing at an arbitrary cap. Scanning a long clip for when something appears wants many small frames; reading fine texture wants few large ones. `start_seconds`/`end_seconds` bound `count` to a window, so a 3-minute video can be sampled densely across the ten seconds that matter.
+
+Passing an image asset returns a message pointing at `immich_get_image` rather than a decode error.
 
 Requires `ffmpeg` in the image — the Dockerfile installs it. Immich reports only a duration for videos and leaves `exifInfo` empty, so fps, rotation and audio come from `ffprobe`.
 

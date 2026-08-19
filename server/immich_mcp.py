@@ -188,12 +188,21 @@ def _summarise(asset: Dict[str, Any]) -> Dict[str, Any]:
 
 # ----------------------------------------------------------------------- video
 
-# Eight frames at 768px is already a substantial slice of a context window, so the
-# cap is deliberate and there is no "every frame" mode. The subjects this exists
-# for - an espresso extraction, a plant moving in wind - change over seconds, not
-# milliseconds, so a handful of chosen moments carries nearly all the information
-# in the clip.
-MAX_VIDEO_FRAMES = 8
+# How many frames is right depends on the clip and on the question being asked, so
+# the caller decides. What is actually scarce is not frame *count* but total area:
+# 32 frames at 256px cost a third of 4 frames at 1440px. The limit is therefore a
+# pixel budget, and the count ceiling below exists only to stop a runaway request,
+# not to express a preference about how many frames are appropriate.
+#
+# Vision cost in tokens is roughly width * height / 750, so the default 24 MP
+# budget is about 32k tokens: 64 frames at 768px, or 20 at 1440px.
+MAX_VIDEO_FRAMES = 64
+VIDEO_FRAME_BUDGET_MP = float(os.environ.get("MCP_VIDEO_FRAME_BUDGET_MP", "24"))
+
+# Frames are decoded from the original file, commonly 4K, so the 1440px ceiling
+# that applies to photographs - the size of Immich's own preview rendition - is
+# not a real limit here.
+VIDEO_MAX_LONG_EDGE = 1920
 
 # Past this much drift between the requested and the delivered moment, the frame
 # is labelled rather than silently mislabelled. Reasoning about *when* something
@@ -713,42 +722,66 @@ async def immich_list_unfiled_assets(
 async def immich_get_video_frames(
     asset_id: Annotated[str, Field(description="Video asset id from immich_list_assets.")],
     timestamps: Annotated[Optional[List[float]], Field(
-        description="Seconds from the start of the clip. Up to 8. Mutually exclusive with count."
+        description="Explicit moments in seconds. Use when you know where to look. "
+                    "Mutually exclusive with count."
     )] = None,
     count: Annotated[Optional[int], Field(
-        description="Alternative to timestamps: N evenly spaced frames across the clip, 2-8. "
-                    "Use for a first pass when the timeline is unknown.", ge=2, le=MAX_VIDEO_FRAMES
+        description="Sample N frames evenly instead of naming moments. Combine with "
+                    "start_seconds/end_seconds to sample a window rather than the whole clip.",
+        ge=1, le=MAX_VIDEO_FRAMES,
+    )] = None,
+    start_seconds: Annotated[Optional[float], Field(
+        description="With count: sample from here instead of the start of the clip.", ge=0
+    )] = None,
+    end_seconds: Annotated[Optional[float], Field(
+        description="With count: sample up to here instead of the end of the clip.", ge=0
     )] = None,
     max_dimension: Annotated[int, Field(
-        description="Longest edge in px (128-1440).", ge=128, le=PREVIEW_LONG_EDGE
+        description="Longest edge in px. Lower is dramatically cheaper — cost scales with "
+                    "area, so 384px costs a quarter of 768px.",
+        ge=64, le=VIDEO_MAX_LONG_EDGE,
     )] = 768,
 ) -> list:
-    """Pull still frames out of a video at chosen moments, as real images.
+    """Decode still frames from a video at moments you choose, returned as images.
 
-    Video cannot be watched through this interface, but the events that matter in
-    a short clip are usually seconds apart, so a handful of stills at the right
-    moments carries nearly all of the diagnostic content.
+    Video cannot be played through this interface, but stills answer most questions
+    about a clip: what happens in it and when, what changed, in what order, how
+    something moved, what a scene contained at a given moment.
 
-    The intended loop is iterative narrowing: start with count=6 for an overview,
-    read what changed and where, then come back with explicit timestamps to
-    bracket the moment - [9.5, 10, 10.5, 11]. That only works because the
-    timestamp reported for each frame is the one actually decoded, not the one
-    requested; where the two differ by more than 0.2s the text block says so.
+    Choose the parameters to fit the question — they are knobs, not ceremony:
 
-    For images use immich_get_image instead. Use immich_get_asset_metadata first
-    to learn the duration, otherwise choosing timestamps is guesswork.
+    - Unknown clip, no idea what is in it: count=8 for an overview, then narrow.
+    - Something happens near a known moment: timestamps=[9.5, 10, 10.5, 11].
+    - A long video where one stretch matters: count=20, start_seconds=120,
+      end_seconds=150 samples that window densely and ignores the rest.
+    - Scanning for when something appears: many small frames beat few large ones.
+      count=48 at max_dimension=320 costs less than count=8 at max_dimension=768.
+    - Reading fine detail — texture, text, a small object: fewer frames, larger.
+      timestamps=[12.4], max_dimension=1440.
+
+    Cost scales with total area, not with frame count, and is bounded by a pixel
+    budget rather than an arbitrary frame limit. If a request exceeds the budget the
+    error says what would fit, so trade resolution against frame count freely.
+
+    Iterative narrowing is the intended pattern: sample coarsely, see roughly where
+    something changes, then re-request that interval closely. It works because the
+    timestamp reported for each frame is the one actually decoded, not the one asked
+    for; drift beyond 0.2s is stated explicitly on the frame.
+
+    For still photographs use immich_get_image. Call immich_get_asset_metadata first
+    if you need the duration before choosing where to look.
 
     Returns:
-        list: for each frame in ascending time order, a TextContent naming the
-        frame index and its true timestamp, followed by an ImageContent (JPEG);
-        then a final TextContent with the clip duration, capture date and which
-        rendition was decoded. On failure, a single TextContent explaining why.
+        list: per frame in ascending time order, a TextContent giving the frame index
+        and its true timestamp, then an ImageContent (JPEG); finally a TextContent
+        with the duration, fps, capture date and the rendition decoded.
+        On failure, a single TextContent explaining why.
     """
     try:
         if (timestamps is None) == (count is None):
             return [TextContent(type="text", text=(
-                "Pass exactly one of timestamps or count. Use count for a first look at a "
-                "clip whose timeline you do not know yet, then timestamps to narrow in."
+                "Pass exactly one of timestamps or count. Use count to sample a clip you "
+                "have not seen yet; use timestamps once you know where to look."
             ))]
 
         meta = await _get_json(f"/api/assets/{asset_id}")
@@ -766,9 +799,8 @@ async def immich_get_video_frames(
                 return [TextContent(type="text", text="timestamps was empty — pass at least one.")]
             if len(timestamps) > MAX_VIDEO_FRAMES:
                 return [TextContent(type="text", text=(
-                    f"{len(timestamps)} frames requested; the limit is {MAX_VIDEO_FRAMES} per call. "
-                    "Eight frames is already a large amount of context — narrow the range and "
-                    "call again rather than widening this one."
+                    f"{len(timestamps)} timestamps requested; {MAX_VIDEO_FRAMES} is the ceiling "
+                    "per call. Split the range across two calls."
                 ))]
             wanted = sorted(float(t) for t in timestamps)
             if wanted[0] < 0:
@@ -778,17 +810,45 @@ async def immich_get_video_frames(
                     f"Timestamp {wanted[-1]:.2f}s is past the end of this {duration:.2f}s clip."
                 ))]
         else:
-            if not duration:
+            if not duration and (start_seconds is None or end_seconds is None):
                 return [TextContent(type="text", text=(
-                    "Could not read this clip's duration, so evenly spaced frames cannot be "
-                    "placed. Pass explicit timestamps instead."
+                    "The duration of this clip could not be read, so evenly spaced frames "
+                    "cannot be placed. Pass explicit timestamps, or a start_seconds and "
+                    "end_seconds window."
                 ))]
-            # Span the clip from its first moment to just short of the last, rather
-            # than the centres of equal segments: the opening instant is usually the
-            # baseline you compare everything else against, and the final frame is
-            # where a decode is most likely to fall off the end of the file.
-            span = duration * 0.98
-            wanted = [round(span * i / (count - 1), 3) for i in range(count)]
+            lo = float(start_seconds) if start_seconds is not None else 0.0
+            # Stop fractionally short of the end: the final frame is where a decode is
+            # most likely to fall off the end of the file.
+            hi = float(end_seconds) if end_seconds is not None else (duration or 0.0) * 0.98
+            if duration:
+                hi = min(hi, duration * 0.999)
+            if hi <= lo:
+                return [TextContent(type="text", text=(
+                    f"The window is empty: start {lo:.2f}s is not before end {hi:.2f}s."
+                ))]
+            wanted = ([round(lo, 3)] if count == 1
+                      else [round(lo + (hi - lo) * i / (count - 1), 3) for i in range(count)])
+
+        # Budget by area. The frame returned is the source scaled to fit inside a
+        # max_dimension box, and rotation metadata swaps the axes before that.
+        src_w, src_h = probe.get("width") or 0, probe.get("height") or 0
+        if abs(int(probe.get("rotation") or 0)) in (90, 270):
+            src_w, src_h = src_h, src_w
+        if src_w and src_h:
+            fit = min(1.0, max_dimension / max(src_w, src_h))
+            per_frame = (src_w * fit) * (src_h * fit)
+            total_mp = per_frame * len(wanted) / 1_000_000
+            if total_mp > VIDEO_FRAME_BUDGET_MP:
+                affordable = max(1, int(VIDEO_FRAME_BUDGET_MP * 1_000_000 // per_frame))
+                fits_dim = int(max_dimension * (VIDEO_FRAME_BUDGET_MP / total_mp) ** 0.5)
+                return [TextContent(type="text", text=(
+                    f"{len(wanted)} frames at {max_dimension}px is about {total_mp:.1f} "
+                    f"megapixels (~{total_mp * 1_000_000 / 750 / 1000:.0f}k vision tokens), over "
+                    f"the {VIDEO_FRAME_BUDGET_MP:.0f} MP budget for one call. Either "
+                    f"{affordable} frames at {max_dimension}px, or all {len(wanted)} at "
+                    f"max_dimension={fits_dim}. Cost scales with area, so halving the "
+                    "dimension buys four times the frames."
+                ))]
 
         out: List[Any] = []
         drifted = 0
@@ -799,8 +859,8 @@ async def immich_get_video_frames(
                 )
             except FFmpegMissing:
                 return [TextContent(type="text", text=(
-                    "ffmpeg is not installed in this server's container, so video frames "
-                    "cannot be decoded. Rebuild the image — the Dockerfile installs it."
+                    "ffmpeg is not installed in this container, so video frames cannot be "
+                    "decoded. Rebuild the image — the Dockerfile installs it."
                 ))]
             except Exception as exc:  # noqa: BLE001 - one bad frame must not lose the rest
                 out.append(TextContent(type="text", text=(
@@ -813,8 +873,7 @@ async def immich_get_video_frames(
             if actual is not None and abs(actual - at) > SEEK_DRIFT_TOLERANCE:
                 drifted += 1
                 note = (f" — NOTE: asked for {at:.2f}s, this frame is {actual:.2f}s "
-                        f"({actual - at:+.2f}s); the nearest decodable frame was not where "
-                        f"it was requested, so read the time on the frame, not the request")
+                        f"({actual - at:+.2f}s); read the time on the frame, not the request")
             out.append(TextContent(type="text", text=(
                 f"Frame {index} of {len(wanted)} — t={shown:.2f}s, {width}x{height}{note}"
             )))
@@ -824,15 +883,13 @@ async def immich_get_video_frames(
 
         taken = meta.get("fileCreatedAt")
         ago = _days_ago(taken)
-        tail = (
-            f"{meta.get('originalFileName')} — {duration:.2f}s"
-            if duration else f"{meta.get('originalFileName')}"
-        )
+        tail = f"{meta.get('originalFileName')}"
+        tail += f" — {duration:.2f}s" if duration else ""
         tail += f", {probe.get('fps')} fps" if probe.get("fps") else ""
         tail += f", filmed {taken}" + (f" ({ago} days ago)" if ago is not None else "")
-        tail += ". Decoded from the original file, not a transcode, so fine texture is intact."
+        tail += ". Decoded from the original file, not a transcode."
         if probe.get("rotation"):
-            tail += f" Rotation metadata of {probe['rotation']}° was applied."
+            tail += f" Rotation metadata of {probe['rotation']} degrees was applied."
         if drifted:
             tail += (f" {drifted} of {len(wanted)} frames landed more than "
                      f"{SEEK_DRIFT_TOLERANCE}s from the requested moment — see the notes above.")
