@@ -21,7 +21,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Annotated, Any, Dict, List, Optional
 
@@ -160,6 +160,44 @@ def _parse_ts(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _local_iso(utc_value: Optional[str], local_value: Optional[str]) -> Optional[str]:
+    """Turn Immich's pair of timestamps into one honest local-time string.
+
+    Immich stores two times per asset: fileCreatedAt, the real UTC instant, and
+    localDateTime, the wall-clock time where the shutter actually fired. The second
+    is the one a person means by "when was this taken" — a meal photographed at
+    13:15 in Israel is 10:15Z, and an assistant that reports the UTC value logs
+    lunch at breakfast.
+
+    Immich serves localDateTime with a Z suffix, which is a lie: the value is wall
+    clock, not UTC. Differencing the two recovers the true offset, so this returns
+    a correct ISO 8601 string like 2026-08-23T13:15:29.276+03:00 rather than
+    passing on a naive time or a mislabelled one.
+
+    Deriving the offset per asset beats a configured server timezone, because it
+    stays right for photographs taken in another country.
+    """
+    utc_dt = _parse_ts(utc_value)
+    local_dt = _parse_ts(local_value)
+    if utc_dt is None or local_dt is None:
+        return None
+    naive_local = local_dt.replace(tzinfo=None)
+    naive_utc = utc_dt.replace(tzinfo=None)
+    # Offsets are whole minutes; rounding absorbs sub-second noise between the two.
+    minutes = round((naive_local - naive_utc).total_seconds() / 60)
+    if abs(minutes) > 18 * 60:  # beyond any real UTC offset - do not invent one
+        return None
+    if minutes == 0:
+        # Immich falls back to UTC when a file carries no timezone - true of
+        # screenshots, forwarded images and many videos - and that is
+        # indistinguishable from a photograph genuinely taken at UTC+0. Returning
+        # None sends the caller to taken_at, which is explicitly marked UTC, rather
+        # than handing over a local time that is confidently wrong by the offset.
+        # Being unhelpful about 9% of a library beats being wrong about it.
+        return None
+    return naive_local.replace(tzinfo=timezone(timedelta(minutes=minutes))).isoformat()
+
+
 def _days_ago(value: Optional[str]) -> Optional[int]:
     ts = _parse_ts(value)
     if ts is None:
@@ -181,6 +219,9 @@ def _summarise(asset: Dict[str, Any]) -> Dict[str, Any]:
         "asset_id": asset.get("id"),
         "filename": asset.get("originalFileName"),
         "taken_at": taken,
+        # The local wall-clock time is what a person means by "when". Both are
+        # returned so the UTC instant stays available for ordering and arithmetic.
+        "taken_at_local": _local_iso(taken, asset.get("localDateTime")),
         "days_ago": _days_ago(taken),
         "type": "video" if asset.get("type") == "VIDEO" else "image",
     }
@@ -409,7 +450,12 @@ async def immich_list_albums() -> str:
           "count": int,
           "albums": [
             {"album_id": str, "name": str, "asset_count": int,
-             "most_recent_asset_at": str|null, "most_recent_days_ago": int|null}
+             "most_recent_asset_at": str|null, "most_recent_asset_at_local": str|null,
+             "most_recent_days_ago": int|null}
+          most_recent_asset_at is the newest asset's real capture time, not the
+          album's date-only endDate, so albums added to on the same day still sort
+          correctly against each other. The _local variant carries the wall-clock
+          time and may be null when the timezone is unknown.
           ]
         }
         On failure, a plain-language sentence beginning "Immich is not responding"
@@ -417,16 +463,41 @@ async def immich_list_albums() -> str:
     """
     try:
         albums = await _get_json("/api/albums")
-        rows = [
-            {
-                "album_id": a.get("id"),
-                "name": a.get("albumName"),
-                "asset_count": a.get("assetCount", 0),
-                "most_recent_asset_at": a.get("endDate"),
-                "most_recent_days_ago": _days_ago(a.get("endDate")),
-            }
-            for a in albums
-        ]
+
+        # An album's endDate is date-only - 2026-08-23T00:00:00.000Z - so using it
+        # throws away the time and makes everything added today look equally recent.
+        # The newest asset's real timestamp needs a search per album, so they run
+        # concurrently, bounded so a large library does not open a hundred sockets.
+        gate = asyncio.Semaphore(8)
+
+        async def newest(album: Dict[str, Any]) -> Dict[str, Any]:
+            if not album.get("assetCount"):
+                return {}
+            async with gate:
+                try:
+                    data = await _post_json(
+                        "/api/search/metadata",
+                        {"albumIds": [album.get("id")], "size": 1, "order": "desc"},
+                    )
+                except Exception:  # noqa: BLE001 - one album must not lose the list
+                    return {}
+            items = (data.get("assets") or {}).get("items") or []
+            return items[0] if items else {}
+
+        latest = await asyncio.gather(*(newest(a) for a in albums))
+
+        rows = []
+        for album, item in zip(albums, latest):
+            # Fall back to the date-only endDate rather than reporting nothing.
+            at = item.get("fileCreatedAt") or album.get("endDate")
+            rows.append({
+                "album_id": album.get("id"),
+                "name": album.get("albumName"),
+                "asset_count": album.get("assetCount", 0),
+                "most_recent_asset_at": at,
+                "most_recent_asset_at_local": _local_iso(at, item.get("localDateTime")),
+                "most_recent_days_ago": _days_ago(at),
+            })
         rows.sort(key=lambda r: r["name"] or "")
         return json.dumps({"count": len(rows), "albums": rows}, ensure_ascii=False, indent=1)
     except Exception as exc:  # noqa: BLE001 - surfaced as an agent-readable string
@@ -461,7 +532,11 @@ async def immich_list_assets(
           "has_more": bool, "next_offset": int|null,
           "assets": [
             {"asset_id": str, "filename": str, "taken_at": str,
-             "days_ago": int, "type": "image"|"video"}
+             "taken_at_local": str|null, "days_ago": int, "type": "image"|"video"}
+          taken_at is UTC. taken_at_local is the wall-clock time where the photograph
+          was taken, with its real offset - prefer it when reporting *when* something
+          happened. It is null when Immich has no timezone for the asset (common for
+          screenshots and some videos); in that case use taken_at and say it is UTC.
           ]
         }
     """
@@ -544,14 +619,16 @@ async def immich_get_image(
         payload = buf.getvalue()
 
         taken = meta.get("fileCreatedAt")
+        local = _local_iso(taken, meta.get("localDateTime"))
         ago = _days_ago(taken)
 
         return [
             TextContent(
                 type="text",
                 text=(
-                    f"{meta.get('originalFileName')} — taken {taken}"
-                    + (f" ({ago} days ago)" if ago is not None else "")
+                    f"{meta.get('originalFileName')} — taken {local or taken}"
+                    + (f" (local time; {taken} UTC)" if local else "")
+                    + (f", {ago} days ago" if ago is not None else "")
                     + f", shown at {img.width}x{img.height}."
                 ),
             ),
@@ -587,7 +664,8 @@ async def immich_get_asset_metadata(
         str: JSON with schema
         {
           "asset_id": str, "filename": str, "type": "image"|"video",
-          "taken_at": str, "days_ago": int, "mime_type": str,
+          "taken_at": str, "taken_at_local": str|null, "timezone": str|null,
+          "days_ago": int, "mime_type": str,
           "width": int|null, "height": int|null, "file_size_bytes": int|null,
           "camera": str|null, "albums": [{"album_id": str, "name": str}]
         }
@@ -606,6 +684,10 @@ async def immich_get_asset_metadata(
             "filename": meta.get("originalFileName"),
             "type": "video" if is_video else "image",
             "taken_at": taken,
+            "taken_at_local": _local_iso(taken, meta.get("localDateTime")),
+            # Immich's own reading of the capture timezone. "UTC" here usually means
+            # it found none rather than that the shutter fired at Greenwich.
+            "timezone": exif.get("timeZone"),
             "days_ago": _days_ago(taken),
             "mime_type": meta.get("originalMimeType"),
             "width": exif.get("exifImageWidth"),
@@ -675,7 +757,11 @@ async def immich_list_unfiled_assets(
           "has_more": bool, "next_offset": int|null,
           "assets": [
             {"asset_id": str, "filename": str, "taken_at": str,
-             "days_ago": int, "type": "image"|"video"}
+             "taken_at_local": str|null, "days_ago": int, "type": "image"|"video"}
+          taken_at is UTC. taken_at_local is the wall-clock time where the photograph
+          was taken, with its real offset - prefer it when reporting *when* something
+          happened. It is null when Immich has no timezone for the asset (common for
+          screenshots and some videos); in that case use taken_at and say it is UTC.
           ]
         }
         An empty list means everything in the library has been filed.
@@ -886,7 +972,8 @@ async def immich_get_video_frames(
         tail = f"{meta.get('originalFileName')}"
         tail += f" — {duration:.2f}s" if duration else ""
         tail += f", {probe.get('fps')} fps" if probe.get("fps") else ""
-        tail += f", filmed {taken}" + (f" ({ago} days ago)" if ago is not None else "")
+        filmed = _local_iso(taken, meta.get("localDateTime")) or taken
+        tail += f", filmed {filmed}" + (f" ({ago} days ago)" if ago is not None else "")
         tail += ". Decoded from the original file, not a transcode."
         if probe.get("rotation"):
             tail += f" Rotation metadata of {probe['rotation']} degrees was applied."
