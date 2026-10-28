@@ -37,6 +37,8 @@ from starlette.routing import Route
 
 # --------------------------------------------------------------------------- config
 
+log = logging.getLogger("immich_mcp")
+
 IMMICH_URL = os.environ.get("IMMICH_URL", "http://immich-server:2283").rstrip("/")
 IMMICH_API_KEY = os.environ.get("IMMICH_API_KEY", "")
 MCP_BEARER_TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
@@ -708,8 +710,9 @@ async def immich_get_asset_metadata(
                 payload["width"] = payload["width"] or probe.get("width")
                 payload["height"] = payload["height"] or probe.get("height")
                 payload["next"] = (
-                    "Use immich_get_video_frames with count=6 for an overview, then explicit "
-                    "timestamps to narrow in on whatever changed."
+                    "Use immich_get_video_transcript for what is said (when has_audio), and "
+                    "immich_get_video_frames with count=6 for an overview of what is shown, "
+                    "then explicit timestamps to narrow in."
                 )
             except FFmpegMissing:
                 payload["video"] = {
@@ -984,6 +987,277 @@ async def immich_get_video_frames(
         return out
     except Exception as exc:  # noqa: BLE001
         return [TextContent(type="text", text=_error(exc))]
+
+
+# --------------------------------------------------------------------------- transcripts
+# A video's words, so a conversation can read what was said and then ask
+# immich_get_video_frames for the moments that matter.
+#
+# ON THIS MACHINE. faster-whisper with ivrit.ai's Hebrew Whisper (large-v3
+# turbo, CTranslate2) - the same model plants-hub and health-mcp use for voice
+# messages. Nothing leaves the house and nothing is billed. The model is
+# downloaded once into TRANSCRIBE_CACHE_DIR (a volume, so a rebuild keeps it),
+# LOADED WHEN A VIDEO IS ASKED ABOUT and let go after TRANSCRIBE_IDLE_SECONDS:
+# held, it is ~2 GB of a machine whose memory is tight.
+
+TRANSCRIBE_MODEL = os.environ.get(
+    "TRANSCRIBE_MODEL", "ivrit-ai/whisper-large-v3-turbo-ct2").strip()
+TRANSCRIBE_DEVICE = os.environ.get("TRANSCRIBE_DEVICE", "").strip() or "cpu"
+TRANSCRIBE_COMPUTE = (os.environ.get("TRANSCRIBE_COMPUTE", "").strip()
+                      or ("float16" if TRANSCRIBE_DEVICE == "cuda" else "int8"))
+TRANSCRIBE_CACHE_DIR = os.environ.get("TRANSCRIBE_CACHE_DIR", "/models").strip() or None
+try:
+    TRANSCRIBE_IDLE_SECONDS = max(0, int(os.environ.get("TRANSCRIBE_IDLE_SECONDS", "600")))
+except ValueError:
+    TRANSCRIBE_IDLE_SECONDS = 600
+# One call transcribes at most this much audio. On the processor the turbo model
+# runs at a few times real time, so twenty minutes is a few minutes' wait; a
+# longer video is read in windows with start_seconds/end_seconds.
+MAX_TRANSCRIBE_SECONDS = float(os.environ.get("MAX_TRANSCRIBE_SECONDS", "1200"))
+
+_whisper = None
+_whisper_lock = asyncio.Lock()
+_whisper_idle: Optional[asyncio.TimerHandle] = None
+# (asset_id, start, end, language) -> transcript. A video does not change, so a
+# second question about the same clip costs nothing.
+_transcripts: Dict[Any, Dict[str, Any]] = {}
+
+
+class WhisperMissing(Exception):
+    """faster-whisper is not installed - the image was built without it."""
+
+
+def _load_whisper():
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise WhisperMissing(str(exc)) from exc
+    try:
+        return WhisperModel(TRANSCRIBE_MODEL, device=TRANSCRIBE_DEVICE,
+                            compute_type=TRANSCRIBE_COMPUTE,
+                            download_root=TRANSCRIBE_CACHE_DIR)
+    except Exception:  # noqa: BLE001 - a card that cannot be had falls back to the processor
+        if TRANSCRIBE_DEVICE == "cpu":
+            raise
+        log.warning("transcription on %s failed; falling back to the processor", TRANSCRIBE_DEVICE)
+        return WhisperModel(TRANSCRIBE_MODEL, device="cpu", compute_type="int8",
+                            download_root=TRANSCRIBE_CACHE_DIR)
+
+
+def _let_go_of_whisper() -> None:
+    global _whisper, _whisper_idle
+    _whisper = None
+    _whisper_idle = None
+    import gc
+    gc.collect()
+
+
+def _hold_whisper_for_a_while() -> None:
+    global _whisper_idle
+    if _whisper_idle is not None:
+        _whisper_idle.cancel()
+        _whisper_idle = None
+    if TRANSCRIBE_IDLE_SECONDS:
+        _whisper_idle = asyncio.get_running_loop().call_later(
+            TRANSCRIBE_IDLE_SECONDS, _let_go_of_whisper)
+
+
+async def _extract_audio(asset_id: str, start: Optional[float], end: Optional[float]) -> bytes:
+    """The clip's sound as 16 kHz mono 16-bit PCM, which is what Whisper hears."""
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
+    if start:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-headers", _ff_headers(), "-i", _video_url(asset_id, "original")]
+    if end is not None:
+        cmd += ["-t", f"{max(0.0, end - (start or 0.0)):.3f}"]
+    cmd += ["-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1"]
+    code, out, err = await _run(cmd, timeout=900.0)
+    if code != 0:
+        raise RuntimeError((err or b"").decode(errors="replace")[-300:] or "no audio decoded")
+    return out or b""
+
+
+def _transcribe_pcm(model, pcm: bytes, language: Optional[str]) -> Dict[str, Any]:
+    import numpy as np
+
+    audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    segments, info = model.transcribe(
+        audio, language=language, beam_size=5, vad_filter=True,
+        condition_on_previous_text=False,
+    )
+    return {
+        "language": getattr(info, "language", language),
+        "language_probability": round(float(getattr(info, "language_probability", 0) or 0), 2),
+        "segments": [
+            {"start": round(float(s.start), 2), "end": round(float(s.end), 2),
+             "text": (s.text or "").strip()}
+            for s in segments if (s.text or "").strip()
+        ],
+    }
+
+
+def _clock(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    h, rest = divmod(seconds, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+@mcp.tool(
+    name="immich_get_video_transcript",
+    annotations={
+        "title": "Transcribe what is said in an Immich video",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def immich_get_video_transcript(
+    asset_id: Annotated[str, Field(description="Video asset id, from immich_list_recent_videos, "
+                                               "immich_list_unfiled_assets or immich_list_assets.")],
+    start_seconds: Annotated[Optional[float], Field(
+        description="Transcribe from here instead of the start. Use for a long video, "
+                    "or to re-read one stretch.", ge=0)] = None,
+    end_seconds: Annotated[Optional[float], Field(
+        description="Transcribe up to here instead of the end.", ge=0)] = None,
+    language: Annotated[Optional[str], Field(
+        description="Language code, e.g. 'he' or 'en'. Leave empty to let the model detect it; "
+                    "pass it when you know, since detection on a short or noisy clip can guess wrong.")] = None,
+) -> str:
+    """Transcribe the speech in a video, with a timestamp on every line.
+
+    Video cannot be played through this interface, so this is how to know what
+    was SAID in a clip; immich_get_video_frames is how to see what was SHOWN.
+    Use them together: read the transcript first, then ask for frames at the
+    moments the words point to - "here you can see the leak" at 1:42 means
+    timestamps=[101, 102, 103].
+
+    Runs on Tomer's machine with ivrit.ai's Hebrew Whisper (it also handles
+    English), so nothing leaves the house. The first call after a quiet spell
+    loads the model, which takes a little longer. A result is kept, so asking
+    about the same clip again is instant.
+
+    One call covers at most 20 minutes of audio; for a longer video pass
+    start_seconds/end_seconds and read it in windows.
+
+    Returns:
+        str: a header (file, duration, language), then one line per stretch of
+        speech as "[m:ss–m:ss] words", then a hint for fetching frames. A clip
+        with no audio track, or with no speech in it, says so plainly.
+    """
+    try:
+        meta = await _get_json(f"/api/assets/{asset_id}")
+        if meta.get("type") != "VIDEO":
+            return (f"{meta.get('originalFileName')} is an image, not a video. "
+                    "Use immich_get_image for photographs.")
+        probe = await _probe_video(asset_id)
+        if not probe.get("has_audio"):
+            return (f"{meta.get('originalFileName')} has no audio track, so there is nothing "
+                    "to transcribe. Use immich_get_video_frames to see it.")
+        duration = probe.get("duration_seconds")
+        lo = float(start_seconds or 0.0)
+        hi = float(end_seconds) if end_seconds is not None else duration
+        if duration and lo >= duration:
+            return f"start_seconds {lo:.1f} is past the end of this {duration:.1f}s video."
+        if hi is not None and duration:
+            hi = min(hi, duration)
+        if hi is not None and hi <= lo:
+            return f"The window is empty: start {lo:.1f}s is not before end {hi:.1f}s."
+        span = (hi - lo) if hi is not None else None
+        if span is not None and span > MAX_TRANSCRIBE_SECONDS:
+            return (f"That is {_clock(span)} of audio; one call transcribes at most "
+                    f"{_clock(MAX_TRANSCRIBE_SECONDS)}. Read it in windows, e.g. "
+                    f"start_seconds={lo:.0f}, end_seconds={lo + MAX_TRANSCRIBE_SECONDS:.0f}.")
+
+        key = (asset_id, round(lo, 1), round(hi, 1) if hi is not None else None,
+               (language or "").strip().lower() or None)
+        result = _transcripts.get(key)
+        if result is None:
+            pcm = await _extract_audio(asset_id, lo or None, end_seconds if end_seconds is not None else None)
+            if len(pcm) < 16000 * 2 // 2:            # under half a second of sound
+                return "The audio track is empty, so there is nothing to transcribe."
+            global _whisper
+            async with _whisper_lock:
+                if _whisper is None:
+                    _whisper = await asyncio.to_thread(_load_whisper)
+                model = _whisper
+                result = await asyncio.to_thread(_transcribe_pcm, model, pcm, key[3])
+                _hold_whisper_for_a_while()
+            _transcripts[key] = result
+
+        name = meta.get("originalFileName")
+        head = f"{name}"
+        head += f" — {_clock(duration)}" if duration else ""
+        if lo or end_seconds is not None:
+            head += f", transcribed {_clock(lo)}–{_clock(hi) if hi is not None else 'end'}"
+        filmed = _local_iso(meta.get("fileCreatedAt"), meta.get("localDateTime"))
+        head += f", filmed {filmed}" if filmed else ""
+        lang = result.get("language")
+        head += f". Language: {lang}" if lang else "."
+        if not language and result.get("language_probability", 1) < 0.6:
+            head += (f" (detected with {result.get('language_probability')} confidence - "
+                     "pass language= if it is wrong)")
+        segments = result.get("segments") or []
+        if not segments:
+            return head + "\n\nNo speech was heard in this stretch."
+        lines = [f"[{_clock(lo + s['start'])}–{_clock(lo + s['end'])}] {s['text']}"
+                 for s in segments]
+        tail = ("\n\nTimes are seconds into the video. To see a moment, call "
+                "immich_get_video_frames with timestamps at those seconds.")
+        return head + "\n\n" + "\n".join(lines) + tail
+    except WhisperMissing:
+        return ("faster-whisper is not installed in this container, so the video cannot be "
+                "transcribed. Rebuild the image - requirements.txt installs it.")
+    except FFmpegMissing:
+        return "ffmpeg is not installed in this container; rebuild the image."
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@mcp.tool(
+    name="immich_list_recent_videos",
+    annotations={
+        "title": "List the newest videos in Immich",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def immich_list_recent_videos(
+    limit: Annotated[int, Field(description="How many, newest first (1-50).", ge=1, le=50)] = 10,
+) -> str:
+    """List the newest videos in the library, filed or not.
+
+    This answers "the video I just uploaded": a phone's backup or an upload in
+    Immich's own app lands here within a minute. Each entry's asset_id feeds
+    immich_get_video_transcript (what was said) and immich_get_video_frames
+    (what was shown).
+
+    Returns:
+        str: JSON {"count": int, "videos": [{"asset_id", "filename", "taken_at",
+        "taken_at_local", "days_ago", "duration_seconds", "uploaded_at"}]}.
+    """
+    try:
+        data = await _post_json("/api/search/metadata",
+                                {"type": "VIDEO", "order": "desc", "size": limit})
+        items = (data.get("assets") or {}).get("items") or []
+        videos = []
+        for a in items[:limit]:
+            entry = _summarise(a)
+            dur = a.get("duration")
+            if isinstance(dur, str) and dur.count(":") == 2:
+                try:
+                    h, m, s = dur.split(":")
+                    entry["duration_seconds"] = round(int(h) * 3600 + int(m) * 60 + float(s), 1)
+                except ValueError:
+                    pass
+            entry["uploaded_at"] = a.get("createdAt")
+            videos.append(entry)
+        return json.dumps({"count": len(videos), "videos": videos}, ensure_ascii=False, indent=1)
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
 
 
 # --------------------------------------------------------------------------- writes

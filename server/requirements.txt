@@ -7,3 +7,6 @@ pillow>=10.3
 uvicorn>=0.30
 starlette>=0.37
 pydantic>=2.7
+# Video transcripts (immich_get_video_transcript): ivrit.ai's Hebrew Whisper on
+# CTranslate2, run on this machine. Brings numpy with it.
+faster-whisper>=1.0
