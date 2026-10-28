@@ -22,6 +22,8 @@ you: "has the hoya put out new growth since June?"
 | `immich_get_asset_metadata` | date, dimensions, size, camera, album membership — plus duration/fps/rotation for video | read |
 | `immich_list_unfiled_assets` | photos in no album yet — the inbox a phone's auto-backup fills | read |
 | `immich_get_video_frames` | still frames from a video at chosen timestamps, as images | read |
+| `immich_get_video_transcript` | what is said in a video, one timestamped line per stretch of speech, transcribed on this machine | read |
+| `immich_list_recent_videos` | the newest videos in the library, filed or not - "the one I just uploaded" | read |
 | `immich_upload_image` | add an image and file it under an album **by name**, created if absent | full |
 | `immich_create_album` | create an empty album | full |
 | `immich_add_to_album` | add existing assets to an album | full |
@@ -105,6 +107,18 @@ Passing an image asset returns a message pointing at `immich_get_image` rather t
 Requires `ffmpeg` in the image — the Dockerfile installs it. Immich reports only a duration for videos and leaves `exifInfo` empty, so fps, rotation and audio come from `ffprobe`.
 
 ---
+
+## Hearing a video
+
+`immich_get_video_transcript` turns a clip's speech into timestamped lines, so a conversation reads what was said and then asks `immich_get_video_frames` for the moments the words point to:
+
+```
+immich_list_recent_videos()                         -> the video just uploaded
+immich_get_video_transcript(asset_id)               -> "[1:42–1:47] here you can see the leak"
+immich_get_video_frames(asset_id, timestamps=[102, 103, 104])
+```
+
+It runs on this machine with faster-whisper and ivrit.ai's Hebrew Whisper (large-v3 turbo, CTranslate2), which handles English too: nothing leaves the house and nothing is billed. The model, about 1.6 GB, is downloaded once into `TRANSCRIBE_CACHE_DIR` (a volume, so a rebuild keeps it), loaded when a video is asked about and let go after `TRANSCRIBE_IDLE_SECONDS` (600). `TRANSCRIBE_DEVICE=cuda` uses a graphics card given to the container and falls back to the processor if it cannot be had. One call covers at most 20 minutes of audio (`MAX_TRANSCRIBE_SECONDS`); a longer video is read in windows. A result is kept in memory, so a second question about the same clip is free.
 
 ## Install
 

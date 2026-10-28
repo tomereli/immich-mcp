@@ -18,6 +18,12 @@
       # Optional: named in the "Immich is unreachable" message.
       IMMICH_HOST_HINT: ${IMMICH_HOST_HINT:-}
       PORT: 3000
+      # Video transcripts. The model (~1.6 GB) is downloaded once into the volume
+      # below and held in memory only while it is being used.
+      TRANSCRIBE_CACHE_DIR: /models
+      # TRANSCRIBE_DEVICE: cuda   # with the graphics card given to the container
+    volumes:
+      - ./immich-mcp-models:/models
     ports:
       - '3000:3000'
     depends_on:
